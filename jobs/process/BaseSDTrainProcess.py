@@ -1723,6 +1723,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
         BaseTrainProcess.run(self)
+
+        if self.train_config.tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            try:
+                torch.backends.cuda.matmul.fp32_precision = "tf32"
+                torch.backends.cudnn.conv.fp32_precision = "tf32"
+            except Exception:
+                pass
+            print_acc("TF32 tensor cores enabled for fp32 matmuls")
+
         params = []
 
         ### HOOK ###
@@ -1958,8 +1969,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
 
 
-                # todo switch everything to proper mixed precision like this
-                self.network.force_to(self.device_torch, dtype=torch.float32)
+                # adapter compute dtype. defaults to fp32 for stability with quantized base
+                # models; set network.dtype (e.g. bf16) to run the adapter on tensor cores
+                self.network.force_to(self.device_torch, dtype=get_torch_dtype(self.network_config.dtype))
                 # give network to sd so it can use it
                 self.sd.network = self.network
                 self.network._update_torch_multiplier()

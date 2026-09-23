@@ -188,6 +188,9 @@ class NetworkConfig:
         self.linear_alpha: float = kwargs.get('linear_alpha', self.alpha)
         self.conv_alpha: float = kwargs.get('conv_alpha', self.conv)
         self.dropout: Union[float, None] = kwargs.get('dropout', None)
+        # compute dtype for the adapter weights. fp32 is the historical default for stability
+        # with quantized base models, bf16/fp16 runs the adapter on tensor cores (faster).
+        self.dtype: str = kwargs.get('dtype', 'fp32')
         self.network_kwargs: dict = kwargs.get('network_kwargs', {})
 
         self.lorm_config: Union[LoRMConfig, None] = None
@@ -396,6 +399,9 @@ class TrainConfig:
         self.batch_size: int = kwargs.get('batch_size', 1)
         self.orig_batch_size: int = self.batch_size
         self.dtype: str = kwargs.get('dtype', 'fp32')
+        # allow TF32 tensor cores for fp32 matmuls (big speedup on consumer GPUs for any
+        # fp32 GEMMs, e.g. an fp32 adapter). Off by default to preserve exact numerics.
+        self.tf32: bool = kwargs.get('tf32', False)
         self.xformers = kwargs.get('xformers', False)
         self.sdp = kwargs.get('sdp', False)
         # see https://huggingface.co/docs/diffusers/main/optimization/attention_backends#available-backends for options
