@@ -28,6 +28,7 @@ upstream:
 """
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -95,7 +96,17 @@ class QwenImage21KVCache:
     """Container for all transformer blocks' prefix KV caches."""
 
     def __init__(self, num_layers: int):
-        self.layer_caches = [QwenImage21KVLayerCache() for _ in range(num_layers)]
+        layer_cls = QwenImage21KVLayerCache
+        if os.environ.get("AITK_MXFP8_ATTN", "0") == "1":
+            # quantized cache: stores mxfp8 kernel buffers instead of bf16
+            # (halves cache memory; decode steps quantize into it in place).
+            # Only usable with the fused mxfp8 decode path (same gate).
+            try:
+                from toolkit.util.mxfp8_attn import Mx8KVLayerCache
+                layer_cls = Mx8KVLayerCache
+            except Exception:
+                pass
+        self.layer_caches = [layer_cls() for _ in range(num_layers)]
 
     def get_layer(self, layer_idx: int) -> QwenImage21KVLayerCache:
         return self.layer_caches[layer_idx]
@@ -357,6 +368,71 @@ def build_qwenimage21_block_causal_mask(
     )
 
 
+def _mx8_fused_prefill(attn, hidden_states, rotary_emb, plan):
+    """Block-causal prefill through the masked mxfp8 kernel: fused
+    norm+rope+quant straight off the to_q/k/v GEMM outputs, one S3M launch with
+    per-row key limits. Returns (B, L, H*D)."""
+    from toolkit.util.mxfp8_attn import mxfp8_attention_fused_bc
+
+    B, L, _ = hidden_states.shape
+    q = attn.to_q(hidden_states).view(L, -1)
+    k = attn.to_k(hidden_states).view(L, -1)
+    v = attn.to_v(hidden_states).view(L, -1)
+    cos = rotary_emb.real.contiguous()
+    sin = rotary_emb.imag.contiguous()
+    out = mxfp8_attention_fused_bc(
+        q, k, v, attn.norm_q.weight, attn.norm_k.weight, cos, sin,
+        float(attn.norm_q.eps), 1.0 / math.sqrt(attn.norm_q.weight.numel()), plan,
+    )
+    return out.view(B, L, -1)
+
+
+def _mx8_fused_decode(attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode):
+    """Fused norm+rope+mxfp8-quant attention for the decode path: one Triton
+    kernel per tensor straight off the to_q/k/v GEMM outputs (no bf16
+    norm/rope round-trip, no transpose copies). Returns (B, L, H*D) or None
+    when unsupported. Gated on AITK_MXFP8_ATTN=1."""
+    from toolkit.util.mxfp8_attn import (
+        Mx8KVLayerCache,
+        fused_decode_available,
+        mxfp8_attention_fused,
+        mxfp8_attention_fused_dec,
+        mxfp8_attention_fused_dec_q8,
+    )
+
+    if not fused_decode_available(hidden_states, attn):
+        return None
+    if layer_cache is not None and kv_cache_mode != "cached":
+        return None
+    B, L, _ = hidden_states.shape
+    eps = float(attn.norm_q.eps)
+    sm_scale = 1.0 / math.sqrt(attn.norm_q.weight.numel())
+    cos = rotary_emb.real.contiguous()
+    sin = rotary_emb.imag.contiguous()
+    q = attn.to_q(hidden_states).view(L, -1)
+    k = attn.to_k(hidden_states).view(L, -1)
+    v = attn.to_v(hidden_states).view(L, -1)
+    if layer_cache is None:
+        out = mxfp8_attention_fused(
+            q, k, v, attn.norm_q.weight, attn.norm_k.weight, cos, sin, eps, sm_scale
+        )
+    elif isinstance(layer_cache, Mx8KVLayerCache):
+        # quantized prefix cache: in-place per-step quant, no bf16 requant
+        out = mxfp8_attention_fused_dec_q8(
+            q, k, v, layer_cache,
+            attn.norm_q.weight, attn.norm_k.weight, cos, sin, eps, sm_scale,
+        )
+    else:
+        cached_k, cached_v = layer_cache.get()  # (B, L_pre, H, D), post-rope
+        out = mxfp8_attention_fused_dec(
+            q, k, v,
+            cached_k[0].reshape(cached_k.shape[1], -1),
+            cached_v[0].reshape(cached_v.shape[1], -1),
+            attn.norm_q.weight, attn.norm_k.weight, cos, sin, eps, sm_scale,
+        )
+    return out.view(B, L, -1)
+
+
 def _qwenimage21_prefix_segments(
     image_ids: torch.Tensor, prefix_len: int
 ) -> list[tuple[int, int, bool]]:
@@ -406,10 +482,21 @@ def _qwenimage21_prepare_qkv(
             # `clone()`, not `contiguous()`: at batch size 1 the prefix slice already counts as contiguous
             # (size-1 dims are ignored), so `contiguous()` returns the same view and the cache would pin the
             # whole prefill K/V for every step of the denoising loop.
-            layer_cache.store(
-                key[:, cache_write_slice].clone(),
-                value[:, cache_write_slice].clone(),
-            )
+            from toolkit.util.mxfp8_attn import Mx8KVLayerCache
+            if isinstance(layer_cache, Mx8KVLayerCache):
+                # quantized cache: quantize the prefix in place; needs the full
+                # joint length to size the buffers (current tokens are written
+                # into the same buffers by every cached step)
+                layer_cache.store(
+                    key[:, cache_write_slice].clone(),
+                    value[:, cache_write_slice].clone(),
+                    total_kv=key.shape[1],
+                )
+            else:
+                layer_cache.store(
+                    key[:, cache_write_slice].clone(),
+                    value[:, cache_write_slice].clone(),
+                )
         elif kv_cache_mode == "cached":
             cached_k, cached_v = layer_cache.get()
             key = torch.cat([cached_k, key], dim=1)
@@ -549,6 +636,28 @@ class QwenImage21AttnProcessor:
         segments: list[tuple[int, int, bool]] | None = None,
         key_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if segments is None and attention_mask is None and rotary_emb is not None:
+            # decode: try the fused norm+rope+mxfp8-quant path first
+            fused = _mx8_fused_decode(
+                attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode
+            )
+            if fused is not None:
+                hidden_states = attn.to_out[0](fused)
+                return attn.to_out[1](hidden_states)
+
+        # prefill: the model passes the mxfp8 block-causal plan as attention_mask
+        # (instead of a flex BlockMask) when the fused path applies
+        from toolkit.util.mxfp8_attn import Mxfp8BCPlan
+        if (
+            segments is not None
+            and isinstance(attention_mask, Mxfp8BCPlan)
+            and rotary_emb is not None
+            and layer_cache is None
+        ):
+            out = _mx8_fused_prefill(attn, hidden_states, rotary_emb, attention_mask)
+            hidden_states = attn.to_out[0](out)
+            return attn.to_out[1](hidden_states)
+
         query, key, value, seq_len_q = _qwenimage21_prepare_qkv(
             attn,
             hidden_states,
@@ -1221,6 +1330,27 @@ class QwenImage21Transformer2DModel(
                 )
                 else _qwenimage21_prefix_segments(image_ids, prefix_len)
             )
+            # mxfp8 block-causal kernel: the plan rides in the attention_mask
+            # slot (only the default processor consumes it; flex gets its
+            # BlockMask above and never sees this). Requires unpadded prompts
+            # (no key_valid holes) and batch 1. Extract mode keeps the SDPA
+            # prefill so the bf16 prefix K/V land in the KV cache.
+            if (
+                attention_mask is None
+                and block_segments is not None
+                and joint_key_valid is None
+                and batch_size == 1
+            ):
+                from toolkit.util.mxfp8_attn import bc_plan_available, build_block_causal_plan
+
+                if bc_plan_available():
+                    attention_mask = build_block_causal_plan(
+                        block_segments,
+                        prefix_len,
+                        image_pad_mask.shape[0],
+                        self.config.num_attention_heads,
+                        hidden_states.device,
+                    )
             cache_write_slice = (
                 slice(0, prefix_len) if kv_cache_mode == "extract" else None
             )

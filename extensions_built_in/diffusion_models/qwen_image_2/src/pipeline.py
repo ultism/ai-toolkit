@@ -26,6 +26,8 @@ import torch.nn.functional as F
 from PIL import Image
 from diffusers.utils.torch_utils import randn_tensor
 
+from .transformer import QwenImage21KVCache
+
 SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
 VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
 PROMPT_TEMPLATE = (
@@ -381,8 +383,28 @@ class QwenImage21Pipeline:
         cond = model.pad_prompt_embeds(conditional_embeds)
         uncond = model.pad_prompt_embeds(unconditional_embeds) if do_cfg else None
 
-        for timestep in scheduler.timesteps:
+        # Prefix KV cache: with causal_condition the prefix (text + condition
+        # images) is timestep-independent, so only step 0 runs the full
+        # block-causal prefill; later steps decode just the target tokens
+        # against the cached prefix (exact in exact arithmetic). Conditional
+        # and unconditional prompts keep separate caches. Disable with
+        # model_kwargs `sampling_kv_cache: false`.
+        use_kv_cache = bool(
+            getattr(transformer.config, "causal_condition", False)
+        ) and bool(model.model_config.model_kwargs.get("sampling_kv_cache", True))
+        num_layers = transformer.config.num_layers
+        cond_cache = QwenImage21KVCache(num_layers) if use_kv_cache else None
+        uncond_cache = (
+            QwenImage21KVCache(num_layers) if use_kv_cache and do_cfg else None
+        )
+
+        for step_index, timestep in enumerate(scheduler.timesteps):
             t = timestep.expand(latents.shape[0]).to(device, dtype=dtype) / 1000
+            cache_kwargs = {}
+            if use_kv_cache:
+                cache_kwargs = {
+                    "kv_cache_mode": "extract" if step_index == 0 else "cached"
+                }
             noise_pred = run_transformer(
                 transformer,
                 latents,
@@ -390,6 +412,8 @@ class QwenImage21Pipeline:
                 *cond,
                 condition_latents=condition_latents,
                 condition_shapes=condition_shapes,
+                kv_cache=cond_cache,
+                **cache_kwargs,
             )
             if do_cfg:
                 uncond_pred = run_transformer(
@@ -399,6 +423,8 @@ class QwenImage21Pipeline:
                     *uncond,
                     condition_latents=condition_latents,
                     condition_shapes=condition_shapes,
+                    kv_cache=uncond_cache,
+                    **cache_kwargs,
                 )
                 noise_pred = uncond_pred + guidance_scale * (noise_pred - uncond_pred)
 
