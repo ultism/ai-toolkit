@@ -1058,6 +1058,41 @@ class QwenImage21Transformer2DModel(
         ]
 
     @classmethod
+    def aitk_from_pretrained(cls, path, subfolder=None, dtype=None, **kwargs):
+        """Load from a diffusers-layout directory (e.g. the official repos).
+
+        Those checkpoints store the SwiGLU as split `gate_layer`/`proj` keys,
+        which only get fused in the single-file load path
+        (`convert_state_dict_on_load`). Read the shards ourselves so directory
+        loads get the same treatment; anything else defers to the standard
+        `from_pretrained`.
+        """
+        if (
+            subfolder
+            and os.path.isdir(path)
+            and os.path.isdir(os.path.join(path, subfolder))
+        ):
+            import glob as _glob
+
+            from safetensors.torch import load_file as _load_file
+
+            state_dict = {}
+            for shard in sorted(
+                _glob.glob(os.path.join(path, subfolder, "*.safetensors"))
+            ):
+                state_dict.update(_load_file(shard))
+            if state_dict:
+                return cls.load_from_state_dict(
+                    state_dict,
+                    dtype or torch.bfloat16,
+                    config_path=path,
+                    subfolder=subfolder,
+                )
+        return super().aitk_from_pretrained(
+            path, subfolder=subfolder, dtype=dtype, **kwargs
+        )
+
+    @classmethod
     def convert_state_dict_on_load(cls, state_dict):
         """Accept the diffusers key layout (split `img_mlp.gate_layer`/`proj`)
         as well as the comfy one this class uses natively (fused
@@ -1293,6 +1328,7 @@ class QwenImage21Transformer2DModel(
             ]
 
         prefix_len = int((~target_token_mask).sum())
+        peritem = None  # set by the prefill branch when the batch is sliced per item
 
         if kv_cache_mode == "cached":
             # decode: only the target image's queries are recomputed. The block-causal mask degenerates to full
@@ -1351,42 +1387,120 @@ class QwenImage21Transformer2DModel(
                         self.config.num_attention_heads,
                         hidden_states.device,
                     )
+            # Padded batches (training): slice every sample to its natural
+            # length -- dropping the trailing pad rows -- and run the fused
+            # block-causal kernels per item with a per-item plan. Measured
+            # ~2x fwd+bwd vs the padded SDPA fallback at 1024px B=4 (~3.5x at
+            # 2048px B=2), at the B=1 per-token ceiling under torch.compile.
+            if (
+                attention_mask is None
+                and block_segments is not None
+                and kv_cache is None
+                and batch_size > 1
+            ):
+                from toolkit.util.mxfp8_attn import bc_plan_available, build_block_causal_plan
+
+                if bc_plan_available():
+                    seq_len = image_pad_mask.shape[0]
+                    if joint_key_valid is None:
+                        pads = [0] * batch_size
+                    else:
+                        # invalid prefix rows are exactly the trailing pads
+                        valid = joint_key_valid[:, :prefix_len].sum(dim=1)
+                        pads = [prefix_len - int(v) for v in valid]
+                    peritem = []
+                    for i in range(batch_size):
+                        pad_i = pads[i]
+                        pre_i = prefix_len - pad_i
+                        rows_i = torch.cat(
+                            [
+                                torch.arange(pre_i, device=hidden_states.device),
+                                torch.arange(prefix_len, seq_len, device=hidden_states.device),
+                            ]
+                        )
+                        # pad rows live at the tail of the last (text) segment
+                        seg_i = [
+                            (s, e - pad_i, t) if j == len(block_segments) - 1 else (s, e, t)
+                            for j, (s, e, t) in enumerate(block_segments)
+                        ]
+                        plan_i = build_block_causal_plan(
+                            seg_i,
+                            pre_i,
+                            seq_len - pad_i,
+                            self.config.num_attention_heads,
+                            hidden_states.device,
+                        )
+                        peritem.append((rows_i, plan_i, seg_i))
             cache_write_slice = (
                 slice(0, prefix_len) if kv_cache_mode == "extract" else None
             )
             block_key_valid = joint_key_valid
 
-        for index_block, block in enumerate(self.transformer_blocks):
-            layer_cache = (
-                kv_cache.get_layer(index_block) if kv_cache is not None else None
-            )
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                joint_hidden_states = self._gradient_checkpointing_func(
-                    block,
-                    joint_hidden_states,
-                    modulation,
-                    rotary_emb,
-                    attention_mask,
-                    modulation_mask,
-                    layer_cache,
-                    kv_cache_mode,
-                    cache_write_slice,
-                    block_segments,
-                    block_key_valid,
+        if peritem is not None:
+            # per-item pass: contiguous natural-length slices; pad rows pass
+            # through untouched (only the target rows are read downstream)
+            out = joint_hidden_states.clone()
+            for i, (rows_i, plan_i, seg_i) in enumerate(peritem):
+                h = joint_hidden_states[i, rows_i].unsqueeze(0)
+                if modulation_mask is None:
+                    mod_i = modulation[i : i + 1]
+                    mask_i = None
+                else:
+                    mod_i = torch.cat(
+                        [modulation[i : i + 1], modulation[batch_size : batch_size + 1]],
+                        dim=0,
+                    )
+                    mask_i = modulation_mask[rows_i]
+                rope_i = rotary_emb[rows_i]
+                for block in self.transformer_blocks:
+                    if torch.is_grad_enabled() and self.gradient_checkpointing:
+                        h = self._gradient_checkpointing_func(
+                            block, h, mod_i, rope_i, plan_i, mask_i,
+                            None, None, None, seg_i, None,
+                        )
+                    else:
+                        h = block(
+                            hidden_states=h,
+                            modulation=mod_i,
+                            rotary_emb=rope_i,
+                            attention_mask=plan_i,
+                            target_token_mask=mask_i,
+                            segments=seg_i,
+                        )
+                out[i, rows_i] = h[0]
+            joint_hidden_states = out
+        else:
+            for index_block, block in enumerate(self.transformer_blocks):
+                layer_cache = (
+                    kv_cache.get_layer(index_block) if kv_cache is not None else None
                 )
-            else:
-                joint_hidden_states = block(
-                    hidden_states=joint_hidden_states,
-                    modulation=modulation,
-                    rotary_emb=rotary_emb,
-                    attention_mask=attention_mask,
-                    target_token_mask=modulation_mask,
-                    layer_cache=layer_cache,
-                    kv_cache_mode=kv_cache_mode,
-                    cache_write_slice=cache_write_slice,
-                    segments=block_segments,
-                    key_valid=block_key_valid,
-                )
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    joint_hidden_states = self._gradient_checkpointing_func(
+                        block,
+                        joint_hidden_states,
+                        modulation,
+                        rotary_emb,
+                        attention_mask,
+                        modulation_mask,
+                        layer_cache,
+                        kv_cache_mode,
+                        cache_write_slice,
+                        block_segments,
+                        block_key_valid,
+                    )
+                else:
+                    joint_hidden_states = block(
+                        hidden_states=joint_hidden_states,
+                        modulation=modulation,
+                        rotary_emb=rotary_emb,
+                        attention_mask=attention_mask,
+                        target_token_mask=modulation_mask,
+                        layer_cache=layer_cache,
+                        kv_cache_mode=kv_cache_mode,
+                        cache_write_slice=cache_write_slice,
+                        segments=block_segments,
+                        key_valid=block_key_valid,
+                    )
 
         joint_hidden_states = self.norm_out(joint_hidden_states, temb, modulation_mask)
         output = self.proj_out(joint_hidden_states)
