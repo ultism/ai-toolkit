@@ -147,6 +147,60 @@ class QwenImage2Model(BaseModel):
         # into 2x2 blocks, one per vision slot
         return VISION_TOKEN_PIXELS
 
+    # ---- quantized-transformer cache (skip re-quantization on every load) ----
+    def _quant_cache_dir(self) -> Optional[str]:
+        if not self.model_config.quantize or self.model_config.layer_offloading:
+            return None
+        root = self.model_config.model_kwargs.get("quant_cache_dir")
+        if not root:
+            return None
+        return os.path.join(root, "transformer")
+
+    def _load_transformer_quant_cache(self, model_path, config_path):
+        cache_dir = self._quant_cache_dir()
+        if cache_dir is None or not os.path.exists(
+            os.path.join(cache_dir, "manifest.json")
+        ):
+            return None
+        from toolkit.util.mxfp8_io import load_quantized
+
+        sd, manifest = load_quantized(cache_dir)
+        if (
+            manifest["qtype"] != self.model_config.qtype
+            or manifest.get("source") != model_path
+        ):
+            self.print_and_status_update("Quant cache mismatch; loading from source")
+            return None
+        config = QwenImage21Transformer2DModel.aitk_load_config(
+            config_path, subfolder="transformer"
+        )
+        transformer = QwenImage21Transformer2DModel.aitk_from_config(config)
+        transformer.load_state_dict(sd, assign=True)
+        transformer.aitk_is_quantized = True
+        transformer.aitk_qtype = manifest["qtype"]
+        # mirror aitk_post_load's dtype cast: non-persistent buffers (e.g.
+        # time_text_embed.time_proj.freqs) are created at init in fp32 and
+        # must follow the model dtype, or the timestep embedding -- and thus
+        # every output -- differs from the freshly-loaded model
+        transformer.to(self.torch_dtype)
+        device = self.component_load_kwargs("transformer")["device"]
+        if device is not None:
+            transformer.to(device)
+        self.print_and_status_update("Transformer loaded from quant cache")
+        return transformer
+
+    def _save_transformer_quant_cache(self, transformer, model_path):
+        cache_dir = self._quant_cache_dir()
+        if cache_dir is None or os.path.exists(
+            os.path.join(cache_dir, "manifest.json")
+        ):
+            return
+        from toolkit.util.mxfp8_io import save_quantized
+
+        save_quantized(
+            transformer, cache_dir, qtype=self.model_config.qtype, source=model_path
+        )
+
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
@@ -167,11 +221,14 @@ class QwenImage2Model(BaseModel):
             base_model_path = model_path
 
         self.print_and_status_update("Loading transformer")
-        transformer = QwenImage21Transformer2DModel.load(
-            model_path,
-            config_path=base_model_path,
-            **self.component_load_kwargs("transformer"),
-        )
+        transformer = self._load_transformer_quant_cache(model_path, base_model_path)
+        if transformer is None:
+            transformer = QwenImage21Transformer2DModel.load(
+                model_path,
+                config_path=base_model_path,
+                **self.component_load_kwargs("transformer"),
+            )
+            self._save_transformer_quant_cache(transformer, model_path)
         flush()
 
         self.print_and_status_update("Loading text encoder")
@@ -182,6 +239,10 @@ class QwenImage2Model(BaseModel):
         # the vision tower stays: any prompt may carry reference images. bf16
         # Conv3d has no fast kernel, the equivalent GEMM does
         text_encoder.patch_vision_patch_embed()
+        # convrot8's stochastic rounding draws from the global RNG; seed right
+        # before TE quantization so a quant-cache hit (which skips the mxfp8
+        # kernel probes) cannot change the TE weights / prompt embeddings
+        torch.manual_seed(0)
         text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
         text_encoder.requires_grad_(False)
         text_encoder.eval()

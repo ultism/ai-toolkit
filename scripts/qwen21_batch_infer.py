@@ -451,6 +451,12 @@ class BatchEngine:
 
         args = self.args
         model_path = resolve_model_path(args.model)
+        cache_root = ""
+        if args.quant_cache_dir:
+            slug = args.model.rstrip("/").split("/")[-1]
+            cache_root = os.path.join(
+                os.path.expanduser(args.quant_cache_dir), slug
+            )
         model_config = ModelConfig(
             arch="qwen_image_2",
             dtype="bf16",
@@ -465,6 +471,7 @@ class BatchEngine:
             model_kwargs={
                 "sampling_kv_cache": args.kv_cache,
                 "control_image_max_pixels": args.control_max_pixels,
+                "quant_cache_dir": cache_root,
             },
         )
         ModelClass = get_model_class(model_config)
@@ -1117,6 +1124,9 @@ def parse_args(argv=None):
     p.add_argument("--encode-batch-size", type=int, default=8)
     p.add_argument("--control-max-pixels", type=int, default=1024 * 1024)
     p.add_argument("--prompt-cache-dir", default="")
+    p.add_argument("--quant-cache-dir", default="~/.cache/aitk_quant",
+                   help="root for the quantized-transformer cache (first run saves "
+                        "mxfp8 weights, later runs skip re-quantization; '' disables)")
     p.add_argument("--ignore-repo-sigmas", action="store_true",
                    help="ignore the repo's shipped sample_sigmas (A/B against the "
                         "linspace+mu-shift schedule)")
