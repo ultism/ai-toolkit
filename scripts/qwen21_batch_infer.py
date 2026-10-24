@@ -280,6 +280,20 @@ class PrefixKVStore:
                     total += value.numel() * value.element_size()
         return total
 
+    @staticmethod
+    def _move(cache, device):
+        """Move every tensor in a KV layer cache between GPU and CPU."""
+        for layer in cache.layer_caches:
+            names = (
+                list(vars(layer))
+                if hasattr(layer, "__dict__")
+                else list(layer.__slots__)
+            )
+            for name in names:
+                value = getattr(layer, name)
+                if torch.is_tensor(value):
+                    setattr(layer, name, value.to(device))
+
     def get(self, key: Tuple):
         entry = self._store.get(key)
         self._tick += 1
@@ -288,6 +302,9 @@ class PrefixKVStore:
             return None
         self.hits += 1
         self._lru[key] = self._tick
+        # caches live on the CPU between jobs; a hit pays one bus crossing
+        # (~0.1 s/GiB) instead of the whole prefill
+        self._move(entry[0], "cuda")
         return entry[0]
 
     def put(self, key: Tuple, cache):
@@ -301,9 +318,11 @@ class PrefixKVStore:
             victim = min(self._lru, key=self._lru.get)
             self.bytes_used -= self._store.pop(victim)[1]
             self._lru.pop(victim)
+        self._move(cache, "cpu")
         self._store[key] = (cache, nbytes)
         self._lru[key] = self._tick
         self.bytes_used += nbytes
+        torch.cuda.empty_cache()
         print(
             f"[prefix-store] put {nbytes / 2**30:.2f} GiB "
             f"({len(self._store)} entries, {self.bytes_used / 2**30:.2f} GiB)",
