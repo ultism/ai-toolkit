@@ -232,12 +232,20 @@ def available(q: torch.Tensor) -> bool:
 try:
     import triton
     import triton.language as tl
+    # torch 2.14's inductor rewrites float8e4nv -> fp8e4nv in generated
+    # sources, but triton 3.8 only exposes the old name; alias it so
+    # recompiled kernels resolve in the compile workers too
+    if not hasattr(tl, "fp8e4nv"):
+        tl.fp8e4nv = tl.float8e4nv
     _TRITON_OK = True
 except ImportError:  # pragma: no cover - triton ships with cuda torch
     _TRITON_OK = False
 
 if _TRITON_OK:
-    _FP8 = tl.float8e4nv
+    # NB: fp8 dtype is referenced inline in the kernels (tl.float8e4nv), never
+    # through a module-level global -- inductor's generated sources rebuild
+    # globals via the NEW triton name (fp8e4nv), which triton 3.8 lacks
+    pass
 
     @triton.jit
     def _e8m0_byte(amax):
@@ -304,7 +312,7 @@ if _TRITON_OK:
         amax = tl.max(tl.abs(g), axis=2)                       # (32, 4)
         eb = _e8m0_byte(amax)
         scale = (eb << 23).to(tl.float32, bitcast=True)        # 2^(eb-127), exact
-        qb = tl.reshape((g / scale[:, :, None]).to(_FP8), (32, 128)).to(tl.uint8, bitcast=True)
+        qb = tl.reshape((g / scale[:, :, None]).to(tl.float8e4nv), (32, 128)).to(tl.uint8, bitcast=True)
         if WRITE_QD:
             tl.store(QD + h * SO * 128 + (ROW_OFF + rows[:, None]) * 128 + cols[None, :], qb)
         if WRITE_QDT:
@@ -320,7 +328,7 @@ if _TRITON_OK:
         amax_t = tl.max(tl.abs(x), axis=0)                     # (128,)
         ebt = _e8m0_byte(amax_t)
         scale_t = (ebt << 23).to(tl.float32, bitcast=True)
-        qtb = tl.trans((x / scale_t[None, :]).to(_FP8).to(tl.uint8, bitcast=True))
+        qtb = tl.trans((x / scale_t[None, :]).to(tl.float8e4nv).to(tl.uint8, bitcast=True))
         if WRITE_QT:
             tl.store(QT + (h * 128 + cols[:, None]) * SO + (ROW_OFF + rows)[None, :], qtb)
         sfpt_off = (h * (SO // 128) * 512 + ((ROW_OFF + t0) // 128) * 512 + 16 * (cols % 32)
