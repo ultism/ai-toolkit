@@ -419,6 +419,20 @@ class MXFp8StaticFrozenWeight(torch.Tensor):
         mode = "rt" if self._sf_rt is not None else ("d1" if self._w_dim1 is not None else "d0")
         return f"MXFp8StaticFrozenWeight({tuple(self.shape)}, {mode})"
 
+    def _stable_hash_for_caching(self) -> str:
+        """AOT cache key. The contract is a deterministic id of the tensor's
+        metadata (not a content checksum); a frozen weight's static mxfp8
+        layout metadata is exactly that."""
+        import hashlib
+
+        mode = "rt" if self._sf_rt is not None else ("d1" if self._w_dim1 is not None else "d0")
+        payload = (
+            tuple(self.shape), str(self._orig_dtype), mode,
+            self._w_dim0.block_size, str(self._w_dim0.elem_dtype),
+            self._w_dim0.is_swizzled_scales,
+        )
+        return hashlib.blake2b(repr(payload).encode(), digest_size=16).hexdigest()
+
     # ---- FSDP2 all-gather extension (official subclass hook) ----
     # The sharded local tensor reports its compressed components as the gather
     # payload (uint8 views: collectives reject fp8 dtypes), so FSDP2 ships fp8
