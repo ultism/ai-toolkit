@@ -837,9 +837,30 @@ class QwenImage21TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         mod1, mod2 = modulation.chunk(2, dim=-1)
 
-        img_modulated, img_gate1 = self._modulate(
-            self.img_norm1(hidden_states), mod1, target_token_mask
-        )
+        # fused residual+norm+modulation (batch-1 inference): keeps the small
+        # modulation table un-broadcast, one kernel per stage instead of ~15
+        # full-tensor ops. Training/grad and B>1 keep the eager route.
+        fused_rnm = not torch.is_grad_enabled()
+        if fused_rnm:
+            from toolkit.util.fused_norm_mod import (
+                fused_norm_mod,
+                fused_norm_mod_available,
+                fused_res_norm_mod,
+                fused_residual_gate,
+            )
+
+            fused_rnm = fused_norm_mod_available(hidden_states)
+            if fused_rnm:
+                scale1, gate1 = mod1.chunk(2, dim=-1)
+                scale2, gate2 = mod2.chunk(2, dim=-1)
+                h_in = hidden_states
+                img_modulated = fused_norm_mod(
+                    h_in, scale1, target_token_mask, self.img_norm1.eps
+                )
+        if not fused_rnm:
+            img_modulated, img_gate1 = self._modulate(
+                self.img_norm1(hidden_states), mod1, target_token_mask
+            )
         attn_output = self.attn(
             hidden_states=img_modulated,
             attention_mask=attention_mask,
@@ -850,12 +871,24 @@ class QwenImage21TransformerBlock(nn.Module):
             segments=segments,
             key_valid=key_valid,
         )
-        hidden_states = hidden_states + img_gate1.tanh() * attn_output
-
-        img_modulated2, img_gate2 = self._modulate(
-            self.img_norm2(hidden_states), mod2, target_token_mask
-        )
-        hidden_states = hidden_states + img_gate2.tanh() * self.img_mlp(img_modulated2)
+        if fused_rnm:
+            hidden_states, img_modulated2 = fused_res_norm_mod(
+                h_in,
+                attn_output,
+                gate1,
+                scale2,
+                target_token_mask,
+                self.img_norm2.eps,
+            )
+            hidden_states = fused_residual_gate(
+                hidden_states, self.img_mlp(img_modulated2), gate2, target_token_mask
+            )
+        else:
+            hidden_states = hidden_states + img_gate1.tanh() * attn_output
+            img_modulated2, img_gate2 = self._modulate(
+                self.img_norm2(hidden_states), mod2, target_token_mask
+            )
+            hidden_states = hidden_states + img_gate2.tanh() * self.img_mlp(img_modulated2)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
