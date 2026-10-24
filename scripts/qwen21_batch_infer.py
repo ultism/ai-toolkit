@@ -304,6 +304,11 @@ class PrefixKVStore:
         self._store[key] = (cache, nbytes)
         self._lru[key] = self._tick
         self.bytes_used += nbytes
+        print(
+            f"[prefix-store] put {nbytes / 2**30:.2f} GiB "
+            f"({len(self._store)} entries, {self.bytes_used / 2**30:.2f} GiB)",
+            flush=True,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -455,6 +460,60 @@ class BatchEngine:
         print(f"[load] {time.time() - t0:.1f}s | {gpu_mem()}", flush=True)
         self.cond_cache = CondImageCache(args.control_max_pixels, self.sd.load_rgba)
         self.lora_manager = LoRAManager(self.sd, mode=args.lora_mode)
+        # sampling uses the repo's own scheduler config (the training scheduler
+        # forces dynamic shifting, which conflicts with fixed distilled sigmas)
+        self._scheduler_proto = None
+        try:
+            from toolkit.samplers.custom_flowmatch_sampler import (
+                CustomFlowMatchEulerDiscreteScheduler,
+            )
+
+            self._scheduler_proto = CustomFlowMatchEulerDiscreteScheduler.from_pretrained(
+                model_path, subfolder="scheduler"
+            )
+        except Exception as e:
+            print(f"[load] repo scheduler unavailable ({e}); using train scheduler", flush=True)
+        # a distilled repo ships its exact sampling schedule (fixed sigmas, no
+        # mu-shift) in model_index.json -- use it whenever steps matches
+        self.sample_sigmas = None
+        if not args.ignore_repo_sigmas:
+            index_path = os.path.join(model_path, "model_index.json")
+            if os.path.exists(index_path):
+                with open(index_path) as f:
+                    self.sample_sigmas = json.load(f).get("sample_sigmas")
+                if self.sample_sigmas:
+                    print(
+                        f"[load] repo ships {len(self.sample_sigmas)}-sigma sample schedule",
+                        flush=True,
+                    )
+
+    def _make_scheduler(self, steps: int, lat_tokens: int):
+        """Per-job scheduler. Prefers the repo's shipped sample_sigmas when the
+        step count matches (distilled models are tuned to that exact schedule);
+        otherwise linspace + mu-shift as in training-time sampling."""
+        import numpy as np
+
+        from extensions_built_in.diffusion_models.qwen_image_2.src.pipeline import (
+            calculate_shift,
+        )
+
+        scheduler = self.sd.get_train_scheduler()
+        if self._scheduler_proto is not None:
+            import copy
+
+            scheduler = copy.deepcopy(self._scheduler_proto)
+        if self.sample_sigmas and steps == len(self.sample_sigmas):
+            scheduler.set_timesteps(
+                sigmas=np.array(self.sample_sigmas), device=self.sd.device_torch
+            )
+        else:
+            sigmas = np.linspace(1.0, 1 / steps, steps)
+            mu = calculate_shift(lat_tokens, 256, 8192, 0.5, 0.9)
+            scheduler.set_timesteps(
+                sigmas=sigmas, device=self.sd.device_torch, mu=mu
+            )
+        scheduler.set_begin_index(0)
+        return scheduler
 
     # ---- component moves (the phase scheduler) ----
     def _move(self, module, device, what):
@@ -622,11 +681,10 @@ class BatchEngine:
     @torch.no_grad()
     def _sample_stream(self, job: Job, cond_latents, cond_keys):
         """One prompt stream, batch 1: the fused mxfp8 path stays engaged."""
-        import numpy as np
+
         from diffusers.utils.torch_utils import randn_tensor
 
         from extensions_built_in.diffusion_models.qwen_image_2.src.pipeline import (
-            calculate_shift,
             pad_prompt_batch,
             run_transformer,
         )
@@ -637,11 +695,7 @@ class BatchEngine:
         lat_h, lat_w = job.height // 16, job.width // 16
         channels = transformer.config.in_channels
 
-        scheduler = sd.get_train_scheduler()
-        sigmas = np.linspace(1.0, 1 / job.steps, job.steps)
-        mu = calculate_shift(lat_h * lat_w, 256, 8192, 0.5, 0.9)
-        scheduler.set_timesteps(sigmas=sigmas, device=device, mu=mu)
-        scheduler.set_begin_index(0)
+        scheduler = self._make_scheduler(job.steps, lat_h * lat_w)
 
         latents = randn_tensor(
             (1, channels, lat_h, lat_w),
@@ -677,8 +731,27 @@ class BatchEngine:
             if cache is None:
                 cache = self._make_kv_cache(quantized=True)
             state[name] = (key, cache, prefilled)
+            if use_kv:
+                print(
+                    f"[prefix] job {job.index} {name}: "
+                    f"{'hit' if prefilled else 'miss'} "
+                    f"(store {len(self.prefix_store._store)} entries, "
+                    f"{self.prefix_store.bytes_used / 2**30:.2f} GiB)",
+                    flush=True,
+                )
 
+        step_times = []
+        profiler = None
+        if os.environ.get("AITK_PROFILE_STEPS") == "1":
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ]
+            )
+            profiler.__enter__()
         for step_index, timestep in enumerate(scheduler.timesteps):
+            t_step = time.time()
             t = timestep.expand(1).to(device, dtype=dtype) / 1000
             preds = {}
             for name, _ in streams:
@@ -713,6 +786,27 @@ class BatchEngine:
                 latents.to(torch.float32),
                 return_dict=False,
             )[0].to(dtype)
+            torch.cuda.synchronize()
+            step_times.append(time.time() - t_step)
+
+        if profiler is not None:
+            profiler.__exit__(None, None, None)
+            print(
+                profiler.key_averages().table(sort_by="cuda_time_total", row_limit=25),
+                flush=True,
+            )
+
+        if step_times:
+            rest = step_times[1:]
+            print(
+                f"[steps] job {job.index}: step0 {step_times[0]:.2f}s"
+                + (
+                    f" | next {len(rest)}x avg {sum(rest)/len(rest):.2f}s"
+                    if rest
+                    else ""
+                ),
+                flush=True,
+            )
 
         if use_kv and reuse:
             for name, _ in streams:
@@ -725,11 +819,10 @@ class BatchEngine:
     def _sample_batch(self, jobs: List[Job], cond_latents):
         """Padded micro-batch. Attention is SDPA here (fused path is batch-1);
         KV cache layers are bf16. Prefix-cache reuse is stream-mode only."""
-        import numpy as np
+
         from diffusers.utils.torch_utils import randn_tensor
 
         from extensions_built_in.diffusion_models.qwen_image_2.src.pipeline import (
-            calculate_shift,
             pad_prompt_batch,
             run_transformer,
         )
@@ -742,11 +835,7 @@ class BatchEngine:
         lat_h, lat_w = job0.height // 16, job0.width // 16
         channels = transformer.config.in_channels
 
-        scheduler = sd.get_train_scheduler()
-        sigmas = np.linspace(1.0, 1 / job0.steps, job0.steps)
-        mu = calculate_shift(lat_h * lat_w, 256, 8192, 0.5, 0.9)
-        scheduler.set_timesteps(sigmas=sigmas, device=device, mu=mu)
-        scheduler.set_begin_index(0)
+        scheduler = self._make_scheduler(job0.steps, lat_h * lat_w)
 
         latents = torch.cat(
             [
@@ -1000,7 +1089,7 @@ def parse_args(argv=None):
     p.add_argument("--prefix-cache-reuse", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="keep finished prefix KV caches (LRU) so repeat jobs skip prefill")
-    p.add_argument("--prefix-cache-budget-gb", type=float, default=2.0)
+    p.add_argument("--prefix-cache-budget-gb", type=float, default=4.0)
     p.add_argument("--sample-batch-size", type=int, default=1,
                    help=">1 pads prompts into real batches (SDPA attention, bf16 cache)")
     p.add_argument("--lora-mode", choices=["hook", "merge"], default="hook")
@@ -1009,6 +1098,9 @@ def parse_args(argv=None):
     p.add_argument("--encode-batch-size", type=int, default=8)
     p.add_argument("--control-max-pixels", type=int, default=1024 * 1024)
     p.add_argument("--prompt-cache-dir", default="")
+    p.add_argument("--ignore-repo-sigmas", action="store_true",
+                   help="ignore the repo's shipped sample_sigmas (A/B against the "
+                        "linspace+mu-shift schedule)")
     # single-prompt convenience (no jobs file)
     p.add_argument("--prompt", action="append", default=[])
     p.add_argument("--width", type=int, default=1024)
