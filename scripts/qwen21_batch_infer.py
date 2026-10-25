@@ -15,11 +15,17 @@ Built around three ideas:
    `low_vram=True` on the ModelConfig parks DiT+TE on CPU right after load.
 
 2. Caches
+   - jobs are packed into fixed-slot iterations. Each iteration holds at most
+     --prompt-cache-slots unique prompt embeddings and --vae-cache-slots
+     unique condition-image latents; all in-memory caches are cleared at the
+     iteration boundary. Repeat prompts/images share a slot, and text-only
+     jobs consume no VAE slot. There is no eviction within an iteration.
    - prompt-embed cache: (prompt, condition images, TE-affecting LoRAs) ->
      CPU embeds; N jobs sharing a prompt pay one TE pass. Optional on-disk
-     persistence (--prompt-cache-dir).
+     persistence (--prompt-cache-dir, off by default).
    - condition-image cache: (path, mtime, budget) -> prepared tensor + packed
-     VAE latents; shared by every job referencing the image.
+     VAE latents; shared by every job referencing the image. Prepared images
+     are released before sampling; only the packed latents remain.
    - prefix KV cache: step 0 ("extract") prefills text+condition K/V once,
      later steps decode only the target tokens. With --prefix-cache-reuse a
      finished cache is kept (LRU, byte budget) and jobs with the same
@@ -161,6 +167,16 @@ def expand_jobs(raw_jobs: List[dict], cli_defaults: dict) -> List[Job]:
 
 
 # --------------------------------------------------------------------------
+# iteration plans
+# --------------------------------------------------------------------------
+@dataclass
+class IterationPlan:
+    jobs: List[Job]
+    prompt_keys: set
+    condition_keys: set
+
+
+# --------------------------------------------------------------------------
 # caches
 # --------------------------------------------------------------------------
 class CondImageCache:
@@ -173,6 +189,14 @@ class CondImageCache:
 
     def clear(self):
         self._cache.clear()
+
+    def nbytes(self) -> int:
+        """Host bytes held by prepared tensors and their PIL copies."""
+        total = 0
+        for prepared, image in self._cache.values():
+            total += prepared.numel() * prepared.element_size()
+            total += image.width * image.height * len(image.getbands())
+        return total
 
     def key_for(self, path: str) -> Tuple:
         st = os.stat(path)  # deliberate early failure for a bad path
@@ -205,19 +229,18 @@ class CondImageCache:
 
 
 class PromptEmbedCache:
-    """(prompt, cond keys, TE-LoRA sig) -> per-sample CPU embeds/mask/slots.
+    """Fixed-slot (prompt, cond keys, TE-LoRA sig) -> CPU embedding cache.
 
-    Byte-budgeted LRU: a spike of unique/long prompts evicts oldest entries
-    instead of growing without bound; a single entry larger than the budget
-    is never admitted (so it cannot flush the whole store).
-    Optionally persisted as one safetensors file per key under `disk_dir`."""
+    Iteration planning reserves all slots up front, so this cache never
+    evicts: exceeding the slot count indicates a scheduler bug. Byte counts
+    are still tracked to report each iteration's actual host footprint.
+    Optionally persisted as one safetensors file per key under `disk_dir`.
+    """
 
-    def __init__(self, disk_dir: Optional[str] = None, budget_bytes: int = 4 * 2**30):
+    def __init__(self, disk_dir: Optional[str] = None, slots: int = 256):
         self.disk_dir = disk_dir
-        self.budget = budget_bytes
+        self.slots = slots
         self._cache: Dict[Tuple, Tuple[Any, Any, Any]] = {}
-        self._lru: Dict[Tuple, int] = {}
-        self._tick = 0
         self.bytes_used = 0
         if disk_dir:
             os.makedirs(disk_dir, exist_ok=True)
@@ -227,22 +250,21 @@ class PromptEmbedCache:
         return sum(v.numel() * v.element_size() for v in value if torch.is_tensor(v))
 
     def _admit(self, key: Tuple, value) -> None:
+        old = self._cache.get(key)
+        if old is None and len(self._cache) >= self.slots:
+            raise RuntimeError(
+                f"prompt embedding cache exceeds its {self.slots}-slot iteration "
+                "reservation; the iteration planner must split this block"
+            )
         nbytes = self._nbytes(value)
-        if nbytes > self.budget:
-            return  # oversized: serve it, but never cache it
-        self._tick += 1
-        while self.bytes_used + nbytes > self.budget and self._cache:
-            victim = min(self._lru, key=self._lru.get)
-            self.bytes_used -= self._nbytes(self._cache.pop(victim))
-            self._lru.pop(victim)
+        if old is not None:
+            self.bytes_used -= self._nbytes(old)
         self._cache[key] = value
-        self._lru[key] = self._tick
         self.bytes_used += nbytes
 
     def clear(self):
         """Iteration end: drop all in-memory entries (disk files persist)."""
         self._cache.clear()
-        self._lru.clear()
         self.bytes_used = 0
 
     def _path(self, key: Tuple) -> str:
@@ -254,8 +276,6 @@ class PromptEmbedCache:
     def get(self, key: Tuple):
         hit = self._cache.get(key)
         if hit is not None:
-            self._tick += 1
-            self._lru[key] = self._tick
             return hit
         if self.disk_dir:
             path = self._path(key)
@@ -483,12 +503,13 @@ class BatchEngine:
         self.sd = None
         self.prompt_cache = PromptEmbedCache(
             args.prompt_cache_dir or None,
-            budget_bytes=int(args.prompt_cache_budget_gb * 2**30),
+            slots=args.prompt_cache_slots,
         )
         self.cond_cache: Optional[CondImageCache] = None
         self.prefix_store = PrefixKVStore(int(args.prefix_cache_budget_gb * 2**30))
         self.lora_manager: Optional[LoRAManager] = None
         self._dit_on_gpu = False
+        self._dit_compiled = False
 
     # ---- loading ----
     def load(self):
@@ -606,12 +627,13 @@ class BatchEngine:
             return
         self._move(self.sd.model, "cuda", "transformer")
         self._dit_on_gpu = True
-        if self.args.compile:
+        if self.args.compile and not self._dit_compiled:
             print("[phase] compiling transformer blocks (dynamic)", flush=True)
             for i, block in enumerate(self.sd.model.transformer_blocks):
                 self.sd.model.transformer_blocks[i] = torch.compile(
                     block, dynamic=True
                 )
+            self._dit_compiled = True
 
     # ---- phase 1: text ----
     @torch.no_grad()
@@ -686,6 +708,11 @@ class BatchEngine:
             for path in job.condition_images:
                 key, prepared, _ = self.cond_cache.get(path)
                 unique.setdefault(key, prepared)
+        if len(unique) > self.args.vae_cache_slots:
+            raise RuntimeError(
+                f"condition VAE cache exceeds its {self.args.vae_cache_slots}-slot "
+                "iteration reservation; the iteration planner must split this block"
+            )
         latents: Dict[Tuple, Tuple[Any, Any]] = {}
         for i, (key, prepared) in enumerate(unique.items()):
             latent = self.sd.encode_images(
@@ -997,14 +1024,125 @@ class BatchEngine:
             )[0].to(dtype)
         return latents
 
-    @torch.no_grad()
+    def _job_cache_keys(self, job: Job) -> Tuple[set, set]:
+        """Unique prompt-embedding and condition-VAE entries consumed by a job."""
+        cond_keys = tuple(self.cond_cache.key_for(p) for p in job.condition_images)
+        te_sig = (
+            job.lora_sig
+            if job.lora_sig and self.lora_manager.has_te_entries(job.lora_sig)
+            else ()
+        )
+        prompt_keys = {(job.prompt, cond_keys, te_sig)}
+        if job.guidance > 1.0:
+            prompt_keys.add((job.negative_prompt, cond_keys, te_sig))
+        return prompt_keys, set(cond_keys)
+
+    def plan_iterations(self, jobs: List[Job]) -> List[IterationPlan]:
+        """Pack consecutive jobs without exceeding either fixed-slot cache.
+
+        A repeat prompt/image costs no additional slot. Text-only jobs have an
+        empty condition set, so their iteration size is not constrained by the
+        VAE slot count. For one-image edit jobs with unique prompts and images,
+        this reduces exactly to min(prompt_slots, vae_slots) jobs per iteration.
+        """
+        prompt_slots = self.args.prompt_cache_slots
+        vae_slots = self.args.vae_cache_slots
+        if prompt_slots < 1 or vae_slots < 1:
+            raise ValueError("prompt and VAE cache slot counts must both be >= 1")
+
+        plans: List[IterationPlan] = []
+        chunk_jobs: List[Job] = []
+        chunk_prompts = set()
+        chunk_conditions = set()
+        for job in jobs:
+            prompt_keys, condition_keys = self._job_cache_keys(job)
+            if len(prompt_keys) > prompt_slots or len(condition_keys) > vae_slots:
+                raise ValueError(
+                    f"job {job.index} needs {len(prompt_keys)} prompt slots and "
+                    f"{len(condition_keys)} VAE slots, but the configured "
+                    f"capacities are {prompt_slots} and {vae_slots}"
+                )
+            if chunk_jobs and (
+                len(chunk_prompts | prompt_keys) > prompt_slots
+                or len(chunk_conditions | condition_keys) > vae_slots
+            ):
+                plans.append(
+                    IterationPlan(chunk_jobs, chunk_prompts, chunk_conditions)
+                )
+                chunk_jobs, chunk_prompts, chunk_conditions = [], set(), set()
+            chunk_jobs.append(job)
+            chunk_prompts.update(prompt_keys)
+            chunk_conditions.update(condition_keys)
+        if chunk_jobs:
+            plans.append(IterationPlan(chunk_jobs, chunk_prompts, chunk_conditions))
+        return plans
+
+    def _clear_iteration_caches(self):
+        self.prompt_cache.clear()
+        self.prefix_store.clear()
+        if self.cond_cache is not None:
+            self.cond_cache.clear()
+
     def run(self, jobs: List[Job]):
         args = self.args
         os.makedirs(args.out_dir, exist_ok=True)
+        plans = self.plan_iterations(jobs)
+        print(
+            f"[cache-plan] {len(jobs)} jobs -> {len(plans)} iteration(s) | "
+            f"per-iteration capacity: {args.prompt_cache_slots} prompt slots, "
+            f"{args.vae_cache_slots} condition-VAE slots",
+            flush=True,
+        )
+
+        t_start = time.time()
+        report = []
+        for iteration, plan in enumerate(plans, 1):
+            print(
+                f"[iteration {iteration}/{len(plans)}] {len(plan.jobs)} jobs | "
+                f"reserved prompt slots {len(plan.prompt_keys)}/"
+                f"{args.prompt_cache_slots}, condition-VAE slots "
+                f"{len(plan.condition_keys)}/{args.vae_cache_slots}",
+                flush=True,
+            )
+            try:
+                report.extend(
+                    self._run_iteration(plan, iteration, len(plans), len(jobs))
+                )
+            finally:
+                # Disk prompt caches, if explicitly enabled, persist. Every
+                # in-memory cache is dropped at every iteration boundary.
+                self._clear_iteration_caches()
+                print(f"[cache] iteration {iteration} caches cleared", flush=True)
+
+        total = time.time() - t_start
+        print(
+            f"[done] {len(jobs)} images in {total:.1f}s "
+            f"({60 * len(jobs) / max(total, 1e-9):.2f} img/min) | "
+            f"prefix cache: {self.prefix_store.hits} hits/"
+            f"{self.prefix_store.misses} misses | {gpu_mem()}",
+            flush=True,
+        )
+        with open(os.path.join(args.out_dir, "report.json"), "w") as f:
+            json.dump({"jobs": report}, f, indent=2, ensure_ascii=False)
+
+    @torch.no_grad()
+    def _run_iteration(
+        self,
+        plan: IterationPlan,
+        iteration: int,
+        total_iterations: int,
+        total_jobs: int,
+    ):
+        jobs = plan.jobs
+        args = self.args
         t_start = time.time()
         torch.cuda.reset_peak_memory_stats()
 
-        print(f"[phase] ENCODE: {len(jobs)} jobs", flush=True)
+        print(
+            f"[phase] ENCODE: {len(jobs)} jobs "
+            f"(iteration {iteration}/{total_iterations})",
+            flush=True,
+        )
         t0 = time.time()
         self.encode_prompts(jobs)
         print(
@@ -1019,6 +1157,30 @@ class BatchEngine:
                 f"[phase] IMAGE-ENCODE done in {time.time() - t0:.1f}s | {gpu_mem()}",
                 flush=True,
             )
+
+        prompt_bytes = self.prompt_cache.bytes_used
+        vae_bytes = sum(
+            latent.numel() * latent.element_size()
+            for latent, _ in cond_latents.values()
+        )
+        prepared_bytes = self.cond_cache.nbytes()
+        cache_bytes = prompt_bytes + vae_bytes + prepared_bytes
+        retained_bytes = prompt_bytes + vae_bytes
+        print(
+            f"[cache] iteration {iteration} block: "
+            f"prompt {prompt_bytes / 2**20:.1f} MiB "
+            f"({len(self.prompt_cache._cache)}/{args.prompt_cache_slots} slots) + "
+            f"VAE {vae_bytes / 2**20:.1f} MiB "
+            f"({len(cond_latents)}/{args.vae_cache_slots} slots) + "
+            f"prepared images {prepared_bytes / 2**20:.1f} MiB = "
+            f"{cache_bytes / 2**20:.1f} MiB; SAMPLE retains "
+            f"{retained_bytes / 2**20:.1f} MiB",
+            flush=True,
+        )
+        # Prompt encoding and VAE encoding are finished. The prepared fp32
+        # tensors and PIL copies are not used by sampling, so do not carry them
+        # through the rest of this iteration.
+        self.cond_cache.clear()
 
         # group jobs: same LoRA set + shape + condition layout
         groups: Dict[Tuple, List[Job]] = {}
@@ -1099,7 +1261,7 @@ class BatchEngine:
                 }
             )
             print(
-                f"[job {job.index + 1}/{len(jobs)}] {out} "
+                f"[job {job.index + 1}/{total_jobs}] {out} "
                 f"sample {sample_s:.1f}s decode {decode_s:.1f}s "
                 f"| {gpu_mem()}",
                 flush=True,
@@ -1109,26 +1271,17 @@ class BatchEngine:
             flush=True,
         )
         del pending
+        del cond_latents
 
-        total = time.time() - t_start
         print(
-            f"[done] {len(jobs)} images in {total:.1f}s "
-            f"({60 * len(jobs) / max(total, 1e-9):.2f} img/min) | "
-            f"prefix cache: {self.prefix_store.hits} hits/"
+            f"[iteration {iteration}/{total_iterations} done] "
+            f"{len(jobs)} images in {time.time() - t_start:.1f}s | "
+            f"prefix cache {self.prefix_store.hits} hits/"
             f"{self.prefix_store.misses} misses, "
-            f"{self.prefix_store.bytes_used / 2**30:.2f} GiB held | {gpu_mem()}",
+            f"{self.prefix_store.bytes_used / 2**30:.2f} GiB held before clear",
             flush=True,
         )
-        with open(os.path.join(args.out_dir, "report.json"), "w") as f:
-            json.dump({"jobs": report}, f, indent=2, ensure_ascii=False)
-
-        # iteration end: drop all in-memory caches so the next iteration starts
-        # with a clean, bounded footprint (disk prompt caches persist)
-        self.prompt_cache.clear()
-        self.prefix_store.clear()
-        if self.cond_cache is not None:
-            self.cond_cache.clear()
-        print("[cache] iteration caches cleared", flush=True)
+        return report
 
 
 def resolve_model_path(model: str) -> str:
@@ -1177,9 +1330,14 @@ def parse_args(argv=None):
                    help="torch.compile the DiT blocks (use with --lora-mode merge or no LoRA)")
     p.add_argument("--encode-batch-size", type=int, default=8)
     p.add_argument("--control-max-pixels", type=int, default=1024 * 1024)
-    p.add_argument("--prompt-cache-dir", default="")
-    p.add_argument("--prompt-cache-budget-gb", type=float, default=4.0,
-                   help="in-memory prompt-embed cache budget (LRU evicts above it)")
+    p.add_argument("--prompt-cache-dir", default="",
+                   help="optional disk persistence (off by default; not needed "
+                        "for fixed-slot iterations)")
+    p.add_argument("--prompt-cache-slots", type=int, default=256,
+                   help="maximum unique prompt/negative embeddings per iteration")
+    p.add_argument("--vae-cache-slots", type=int, default=256,
+                   help="maximum unique condition-image latents per iteration; "
+                        "text-only jobs consume none")
     p.add_argument("--quant-cache-dir", default="~/.cache/aitk_quant",
                    help="root for the quantized-transformer cache (first run saves "
                         "mxfp8 weights, later runs skip re-quantization; '' disables)")
