@@ -171,6 +171,9 @@ class CondImageCache:
         self.rgba = rgba
         self._cache: Dict[Tuple, Tuple[Any, Any]] = {}
 
+    def clear(self):
+        self._cache.clear()
+
     def key_for(self, path: str) -> Tuple:
         st = os.stat(path)  # deliberate early failure for a bad path
         return (os.path.abspath(path), int(st.st_mtime), self.budget, self.rgba)
@@ -204,13 +207,43 @@ class CondImageCache:
 class PromptEmbedCache:
     """(prompt, cond keys, TE-LoRA sig) -> per-sample CPU embeds/mask/slots.
 
+    Byte-budgeted LRU: a spike of unique/long prompts evicts oldest entries
+    instead of growing without bound; a single entry larger than the budget
+    is never admitted (so it cannot flush the whole store).
     Optionally persisted as one safetensors file per key under `disk_dir`."""
 
-    def __init__(self, disk_dir: Optional[str] = None):
+    def __init__(self, disk_dir: Optional[str] = None, budget_bytes: int = 4 * 2**30):
         self.disk_dir = disk_dir
+        self.budget = budget_bytes
         self._cache: Dict[Tuple, Tuple[Any, Any, Any]] = {}
+        self._lru: Dict[Tuple, int] = {}
+        self._tick = 0
+        self.bytes_used = 0
         if disk_dir:
             os.makedirs(disk_dir, exist_ok=True)
+
+    @staticmethod
+    def _nbytes(value) -> int:
+        return sum(v.numel() * v.element_size() for v in value if torch.is_tensor(v))
+
+    def _admit(self, key: Tuple, value) -> None:
+        nbytes = self._nbytes(value)
+        if nbytes > self.budget:
+            return  # oversized: serve it, but never cache it
+        self._tick += 1
+        while self.bytes_used + nbytes > self.budget and self._cache:
+            victim = min(self._lru, key=self._lru.get)
+            self.bytes_used -= self._nbytes(self._cache.pop(victim))
+            self._lru.pop(victim)
+        self._cache[key] = value
+        self._lru[key] = self._tick
+        self.bytes_used += nbytes
+
+    def clear(self):
+        """Iteration end: drop all in-memory entries (disk files persist)."""
+        self._cache.clear()
+        self._lru.clear()
+        self.bytes_used = 0
 
     def _path(self, key: Tuple) -> str:
         import hashlib
@@ -219,8 +252,11 @@ class PromptEmbedCache:
         return os.path.join(self.disk_dir, f"pe_{digest}.safetensors")
 
     def get(self, key: Tuple):
-        if key in self._cache:
-            return self._cache[key]
+        hit = self._cache.get(key)
+        if hit is not None:
+            self._tick += 1
+            self._lru[key] = self._tick
+            return hit
         if self.disk_dir:
             path = self._path(key)
             if os.path.exists(path):
@@ -228,14 +264,14 @@ class PromptEmbedCache:
 
                 sd = load_file(path, device="cpu")
                 hit = (sd["embeds"], sd["mask"], sd["slots"].bool())
-                self._cache[key] = hit
+                self._admit(key, hit)
                 return hit
         return None
 
     def put(self, key: Tuple, value: Tuple[Any, Any, Any]):
         embeds, mask, slots = value
         value = (embeds.cpu(), mask.cpu(), slots.cpu().bool())
-        self._cache[key] = value
+        self._admit(key, value)
         if self.disk_dir:
             from safetensors.torch import save_file
 
@@ -265,6 +301,13 @@ class PrefixKVStore:
         self.bytes_used = 0
         self.hits = 0
         self.misses = 0
+
+    def clear(self):
+        """Iteration end: drop every cached prefix (CPU-resident already)."""
+        self._store.clear()
+        self._lru.clear()
+        self.bytes_used = 0
+        torch.cuda.empty_cache()
 
     @staticmethod
     def _nbytes(cache) -> int:
@@ -438,7 +481,10 @@ class BatchEngine:
     def __init__(self, args):
         self.args = args
         self.sd = None
-        self.prompt_cache = PromptEmbedCache(args.prompt_cache_dir or None)
+        self.prompt_cache = PromptEmbedCache(
+            args.prompt_cache_dir or None,
+            budget_bytes=int(args.prompt_cache_budget_gb * 2**30),
+        )
         self.cond_cache: Optional[CondImageCache] = None
         self.prefix_store = PrefixKVStore(int(args.prefix_cache_budget_gb * 2**30))
         self.lora_manager: Optional[LoRAManager] = None
@@ -1076,6 +1122,14 @@ class BatchEngine:
         with open(os.path.join(args.out_dir, "report.json"), "w") as f:
             json.dump({"jobs": report}, f, indent=2, ensure_ascii=False)
 
+        # iteration end: drop all in-memory caches so the next iteration starts
+        # with a clean, bounded footprint (disk prompt caches persist)
+        self.prompt_cache.clear()
+        self.prefix_store.clear()
+        if self.cond_cache is not None:
+            self.cond_cache.clear()
+        print("[cache] iteration caches cleared", flush=True)
+
 
 def resolve_model_path(model: str) -> str:
     """Repo id -> local snapshot dir (downloading if needed); a directory
@@ -1124,6 +1178,8 @@ def parse_args(argv=None):
     p.add_argument("--encode-batch-size", type=int, default=8)
     p.add_argument("--control-max-pixels", type=int, default=1024 * 1024)
     p.add_argument("--prompt-cache-dir", default="")
+    p.add_argument("--prompt-cache-budget-gb", type=float, default=4.0,
+                   help="in-memory prompt-embed cache budget (LRU evicts above it)")
     p.add_argument("--quant-cache-dir", default="~/.cache/aitk_quant",
                    help="root for the quantized-transformer cache (first run saves "
                         "mxfp8 weights, later runs skip re-quantization; '' disables)")
